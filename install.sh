@@ -259,7 +259,7 @@ if [ "$HAS_TTY" = true ]; then
     done
 
     if [ -n "$ENV_CONTENT" ]; then
-        printf '%s' "$ENV_CONTENT" > "$INSTALL_DIR/.env"
+        printf '%s' "$ENV_CONTENT" >> "$INSTALL_DIR/.env"
         ok ".env saved"
     else
         if [ -f "$INSTALL_DIR/.env" ]; then
