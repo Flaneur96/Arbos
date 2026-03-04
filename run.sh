@@ -67,11 +67,16 @@ run() {
 
 # ── Detect context ───────────────────────────────────────────────────────────
 
+REPO_URL="https://github.com/unconst/Arbos.git"
 INSTALL_DIR=""
+
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-[ -z "$INSTALL_DIR" ] && INSTALL_DIR="$(pwd)"
+
+if [ -z "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/pyproject.toml" ]; then
+    INSTALL_DIR="$HOME/Agent"
+fi
 
 HAS_TTY=false
 if [ -t 0 ] || { [ -e /dev/tty ] && (echo >/dev/tty) 2>/dev/null; }; then
@@ -122,7 +127,23 @@ done
 
 printf "\n"
 
-# ── 3. Install tooling ──────────────────────────────────────────────────────
+# ── 3. Clone repo ───────────────────────────────────────────────────────────
+
+printf "  ${BOLD}Cloning repo${NC}\n\n"
+
+if [ -f "$INSTALL_DIR/pyproject.toml" ]; then
+    ok "Project already exists at $INSTALL_DIR"
+else
+    if [ -d "$INSTALL_DIR" ]; then
+        die "$INSTALL_DIR exists but has no pyproject.toml — remove it first or set INSTALL_DIR"
+    fi
+    run "Cloning $REPO_URL → $INSTALL_DIR" git clone "$REPO_URL" "$INSTALL_DIR"
+    [ -f "$INSTALL_DIR/pyproject.toml" ] || die "Clone failed — pyproject.toml not found"
+fi
+
+printf "\n"
+
+# ── 4. Install tooling ──────────────────────────────────────────────────────
 
 printf "  ${BOLD}Installing tooling${NC}\n\n"
 
@@ -160,7 +181,7 @@ fi
 
 printf "\n"
 
-# ── 4. Python environment ───────────────────────────────────────────────────
+# ── 5. Python environment ───────────────────────────────────────────────────
 
 printf "  ${BOLD}Setting up project${NC}\n\n"
 
@@ -179,7 +200,7 @@ mkdir -p history scratch
 
 printf "\n"
 
-# ── 5. Edit PROMPT.md ───────────────────────────────────────────────────────
+# ── 6. Edit PROMPT.md ───────────────────────────────────────────────────────
 
 printf "  ${BOLD}Prompt${NC}\n\n"
 
@@ -204,7 +225,7 @@ fi
 
 printf "\n"
 
-# ── 6. Cursor API key ────────────────────────────────────────────────────────
+# ── 7. Cursor API key ────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Authentication${NC}\n\n"
 
@@ -239,7 +260,7 @@ fi
 
 printf "\n"
 
-# ── 7. Collect .env (optional extra vars) ────────────────────────────────────
+# ── 8. Collect .env (optional extra vars) ────────────────────────────────────
 
 printf "  ${BOLD}Environment variables${NC}\n\n"
 
@@ -278,7 +299,7 @@ fi
 
 printf "\n"
 
-# ── 8. Start agent ───────────────────────────────────────────────────────────
+# ── 9. Start agent ───────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Starting agent${NC}\n\n"
 
