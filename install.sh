@@ -137,15 +137,13 @@ else
     command_exists uv || die "uv install failed"
 fi
 
-# Cursor
-if command_exists cursor; then
-    ok "Cursor already installed"
+# Cursor CLI (agent command)
+if command_exists agent; then
+    ok "Cursor CLI (agent) already installed"
 else
-    CURSOR_URL="https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
-    CURSOR_APPIMAGE="$HOME/.local/bin/cursor.AppImage"
-    mkdir -p "$HOME/.local/bin"
-    run "Installing Cursor" bash -c "curl -L '$CURSOR_URL' -o '$CURSOR_APPIMAGE' && chmod +x '$CURSOR_APPIMAGE' && ln -sf '$CURSOR_APPIMAGE' '$HOME/.local/bin/cursor'"
-    command_exists cursor || die "Cursor install failed"
+    run "Installing Cursor CLI" bash -c "curl https://cursor.com/install -fsS | bash"
+    export PATH="$HOME/.local/bin:$PATH"
+    command_exists agent || die "'agent' command not found — install Cursor CLI from https://cursor.com/install"
 fi
 
 # PATH persistence
@@ -242,20 +240,37 @@ SESSION="agent"
 
 printf "  ${BOLD}Starting agent${NC}\n\n"
 
+# Pre-flight: verify agent CLI is available
+if ! command_exists agent; then
+    die "'agent' command not found in PATH — Cursor CLI is required"
+fi
+ok "agent CLI found at $(which agent)"
+
 # Kill existing session if present
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux kill-session -t "$SESSION"
     ok "Killed previous session"
 fi
 
-tmux new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
-    "$INSTALL_DIR/.venv/bin/python3 $INSTALL_DIR/agent.py"
+LAUNCH_SCRIPT="$INSTALL_DIR/.agent-launch.sh"
+cat > "$LAUNCH_SCRIPT" <<LAUNCH
+#!/usr/bin/env bash
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+cd "$INSTALL_DIR"
+source .venv/bin/activate
+exec python3 agent.py 2>&1
+LAUNCH
+chmod +x "$LAUNCH_SCRIPT"
 
-sleep 1
+tmux new-session -d -s "$SESSION" -c "$INSTALL_DIR" "$LAUNCH_SCRIPT"
+
+sleep 2
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     ok "Agent running in tmux session '${SESSION}'"
 else
-    die "Agent failed to start"
+    err "Agent failed to start — attach to see error output:"
+    printf "    ${DIM}tmux new-session -s debug -c '$INSTALL_DIR' '$LAUNCH_SCRIPT'${NC}\n"
+    die "Try the above command to see the error interactively"
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
