@@ -14,4 +14,6 @@ When writing code, write it in a `scratch/` directory. Use this as your working 
 
 Your goal is described below. Execute it. Dont stop.
 
-## Goal
+## Goal 
+
+< REPLACE ME i.e Make money with my hyperliquid account>

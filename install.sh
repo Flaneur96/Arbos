@@ -47,15 +47,22 @@ spin() {
 
 run() {
     local msg="$1"; shift
-    local tmp=$(mktemp)
-    "$@" >"$tmp" 2>&1 &
+    local tmp_out=$(mktemp) tmp_err=$(mktemp)
+    "$@" >"$tmp_out" 2>"$tmp_err" &
     local pid=$!
     if ! spin $pid "$msg"; then
-        tail -3 "$tmp" 2>/dev/null | while IFS= read -r l; do printf "    %s\n" "$l"; done
-        rm -f "$tmp"
+        if [ -s "$tmp_err" ]; then
+            printf "\n    ${RED}${BOLD}stderr:${NC}\n"
+            while IFS= read -r l; do printf "    ${DIM}%s${NC}\n" "$l"; done < "$tmp_err"
+        elif [ -s "$tmp_out" ]; then
+            printf "\n    ${RED}${BOLD}output:${NC}\n"
+            tail -20 "$tmp_out" | while IFS= read -r l; do printf "    ${DIM}%s${NC}\n" "$l"; done
+        fi
+        printf "\n"
+        rm -f "$tmp_out" "$tmp_err"
         return 1
     fi
-    rm -f "$tmp"
+    rm -f "$tmp_out" "$tmp_err"
 }
 
 # ── Detect context ───────────────────────────────────────────────────────────
@@ -171,7 +178,32 @@ mkdir -p history scratch
 
 printf "\n"
 
-# ── 5. Collect .env ──────────────────────────────────────────────────────────
+# ── 5. Edit PROMPT.md ───────────────────────────────────────────────────────
+
+printf "  ${BOLD}Prompt${NC}\n\n"
+
+printf "  ${CYAN}PROMPT.md${NC} is the system prompt fed to the agent at every step.\n"
+printf "  It tells the agent who it is, where to find its goal, how to\n"
+printf "  store history, and any persistent hints you want to pass along.\n\n"
+printf "  ${DIM}You're about to open it in vim — edit it to your liking,${NC}\n"
+printf "  ${DIM}then save and quit (:wq) to continue the install.${NC}\n\n"
+
+if [ "$HAS_TTY" = true ]; then
+    printf "  ${DIM}Press any key to open PROMPT.md in vim...${NC}"
+    read -rsn1 </dev/tty 2>/dev/null || true
+    printf "\n\n"
+
+    vim "$INSTALL_DIR/PROMPT.md" </dev/tty >/dev/tty
+
+    ok "PROMPT.md saved"
+else
+    [ -f "$INSTALL_DIR/PROMPT.md" ] || die "No TTY and no PROMPT.md — cannot configure"
+    ok "PROMPT.md exists (no TTY, skipping editor)"
+fi
+
+printf "\n"
+
+# ── 6. Collect .env ──────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Configuration${NC}\n\n"
 
@@ -200,31 +232,6 @@ if [ "$HAS_TTY" = true ]; then
 else
     [ -f "$INSTALL_DIR/.env" ] || die "No TTY and no .env — cannot configure"
     ok ".env exists"
-fi
-
-printf "\n"
-
-# ── 6. Edit PROMPT.md ───────────────────────────────────────────────────────
-
-printf "  ${BOLD}Prompt${NC}\n\n"
-
-printf "  ${CYAN}PROMPT.md${NC} is the system prompt fed to the agent at every step.\n"
-printf "  It tells the agent who it is, where to find its goal, how to\n"
-printf "  store history, and any persistent hints you want to pass along.\n\n"
-printf "  ${DIM}You're about to open it in vim — edit it to your liking,${NC}\n"
-printf "  ${DIM}then save and quit (:wq) to continue the install.${NC}\n\n"
-
-if [ "$HAS_TTY" = true ]; then
-    printf "  ${DIM}Press any key to open PROMPT.md in vim...${NC}"
-    read -rsn1 </dev/tty 2>/dev/null || true
-    printf "\n\n"
-
-    vim "$INSTALL_DIR/PROMPT.md" </dev/tty >/dev/tty
-
-    ok "PROMPT.md saved"
-else
-    [ -f "$INSTALL_DIR/PROMPT.md" ] || die "No TTY and no PROMPT.md — cannot configure"
-    ok "PROMPT.md exists (no TTY, skipping editor)"
 fi
 
 printf "\n"
