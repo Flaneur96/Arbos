@@ -1,6 +1,6 @@
-# Arbos (>1000 line infinitely adaptable agent)
+# Arbos
 
-All you need is a Ralph loop and a telegram bot.
+All you need is a Ralph loop and a Telegram bot.
 
 ## Getting started
 
