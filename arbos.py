@@ -283,7 +283,7 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "anthropic/claude-haiku-3.5")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "anthropic/claude-3.5-haiku")
 IS_ROOT = os.getuid() == 0
 
 
