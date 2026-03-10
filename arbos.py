@@ -282,7 +282,7 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.5")
 
 
 def _write_claude_settings():

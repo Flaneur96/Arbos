@@ -1,24 +1,47 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+*.egg
 
 # Virtual environments
-.venv
+.venv/
 
-logs
-context
-context/*
-history/*
-scratch/*
-logs/*
+# Environment & secrets
 .env
+.env.*
+
+# uv
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime / state
 .arbos-launch.sh
 .arbos.pid
 .restart
+chat_id.txt
+logs/
+history/
+scratch/
+
+# Context (generated run data)
+context/
+
+# Codex
 .codex-pool/
 .claude/settings.local.json
-chat_id.txt
