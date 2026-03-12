@@ -31,10 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
 
 ## Usage
 
-Arbos runs a loop which passes `GOAL.md` to a coding agent. 
-To run Arbos just tell the agent what you want `GOAL.md` to be.
-
-Example prompt:
+Arbos just loops a `GOAL.md` through a coding agent. 
+So just tell the agent what you want `GOAL.md` to be, i.e:
 ```
 R = you = an autonomous research agent with capital, data, and compute
 
@@ -64,6 +62,8 @@ end
 
 Dont stop. Be proactive.
 ```
+
+Then iterate.
 
 ---
 
