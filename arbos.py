@@ -11,16 +11,19 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 
+import re
+
 from dotenv import load_dotenv
 import httpx
 import requests
 import uvicorn
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 WORKING_DIR = Path(__file__).parent
-load_dotenv(WORKING_DIR / ".env")
-
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 CONTEXT_DIR = WORKING_DIR / "context"
 GOAL_FILE = CONTEXT_DIR / "GOAL.md"
@@ -30,22 +33,203 @@ RUNS_DIR = CONTEXT_DIR / "runs"
 CHATLOG_DIR = CONTEXT_DIR / "chat"
 RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
+ENV_ENC_FILE = WORKING_DIR / ".env.enc"
+
+# ── Encrypted .env ───────────────────────────────────────────────────────────
+
+def _derive_fernet_key(passphrase: str) -> bytes:
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=b"arbos-env-v1", iterations=200_000)
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode()))
+
+
+def _encrypt_env_file(bot_token: str):
+    """Encrypt .env → .env.enc and delete the plaintext file."""
+    env_path = WORKING_DIR / ".env"
+    plaintext = env_path.read_bytes()
+    f = Fernet(_derive_fernet_key(bot_token))
+    ENV_ENC_FILE.write_bytes(f.encrypt(plaintext))
+    os.chmod(str(ENV_ENC_FILE), 0o600)
+    env_path.unlink()
+
+
+def _decrypt_env_content(bot_token: str) -> str:
+    """Decrypt .env.enc and return plaintext (never written to disk)."""
+    f = Fernet(_derive_fernet_key(bot_token))
+    return f.decrypt(ENV_ENC_FILE.read_bytes()).decode()
+
+
+def _load_encrypted_env(bot_token: str) -> bool:
+    """Decrypt .env.enc, load into os.environ. Returns True on success."""
+    if not ENV_ENC_FILE.exists():
+        return False
+    try:
+        content = _decrypt_env_content(bot_token)
+    except InvalidToken:
+        return False
+    for line in content.splitlines():
+        line = line.split("#")[0].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    return True
+
+
+def _save_to_encrypted_env(key: str, value: str):
+    """Add/update a single key in the encrypted env file."""
+    bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+    if not bot_token or not ENV_ENC_FILE.exists():
+        return
+    try:
+        content = _decrypt_env_content(bot_token)
+    except InvalidToken:
+        return
+    lines = content.splitlines()
+    updated = False
+    for i, line in enumerate(lines):
+        stripped = line.split("#")[0].strip()
+        if stripped.startswith(f"{key}="):
+            lines[i] = f"{key}='{value}'"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}='{value}'")
+    f = Fernet(_derive_fernet_key(bot_token))
+    ENV_ENC_FILE.write_bytes(f.encrypt("\n".join(lines).encode()))
+    os.environ[key] = value
+
+
+ENV_PENDING_FILE = CONTEXT_DIR / ".env.pending"
+
+
+def _init_env():
+    """Load environment from .env (plaintext) or .env.enc (encrypted)."""
+    env_path = WORKING_DIR / ".env"
+
+    if env_path.exists():
+        load_dotenv(env_path)
+        return
+
+    bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+    if ENV_ENC_FILE.exists() and bot_token:
+        if _load_encrypted_env(bot_token):
+            return
+        print("ERROR: failed to decrypt .env.enc — wrong TAU_BOT_TOKEN?", file=sys.stderr)
+        sys.exit(1)
+
+    if ENV_ENC_FILE.exists() and not bot_token:
+        print("ERROR: .env.enc exists but TAU_BOT_TOKEN not set.", file=sys.stderr)
+        print("Pass it as an env var: TAU_BOT_TOKEN=xxx python arbos.py", file=sys.stderr)
+        sys.exit(1)
+
+
+def _process_pending_env():
+    """Pick up env vars the operator agent wrote to .env.pending and persist them."""
+    if not ENV_PENDING_FILE.exists():
+        return
+    content = ENV_PENDING_FILE.read_text().strip()
+    ENV_PENDING_FILE.unlink(missing_ok=True)
+    if not content:
+        return
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip("'\"")
+        os.environ[k] = v
+
+    env_path = WORKING_DIR / ".env"
+    if env_path.exists():
+        with open(env_path, "a") as f:
+            f.write("\n" + content + "\n")
+    elif ENV_ENC_FILE.exists():
+        bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+        if bot_token:
+            try:
+                existing = _decrypt_env_content(bot_token)
+            except InvalidToken:
+                existing = ""
+            new_content = existing.rstrip() + "\n" + content + "\n"
+            enc = Fernet(_derive_fernet_key(bot_token))
+            ENV_ENC_FILE.write_bytes(enc.encrypt(new_content.encode()))
+
+    _reload_env_secrets()
+    _log(f"loaded pending env vars from .env.pending")
+
+
+_init_env()
+
+# ── Redaction ────────────────────────────────────────────────────────────────
+
+_SECRET_KEY_WORDS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "SEED", "CREDENTIAL"}
+
+_SECRET_PATTERNS = [
+    re.compile(r'sk-[a-zA-Z0-9_\-]{20,}'),
+    re.compile(r'sk_[a-zA-Z0-9_\-]{20,}'),
+    re.compile(r'sk-proj-[a-zA-Z0-9_\-]{20,}'),
+    re.compile(r'sk-or-v1-[a-fA-F0-9]{20,}'),
+    re.compile(r'ghp_[a-zA-Z0-9]{20,}'),
+    re.compile(r'gho_[a-zA-Z0-9]{20,}'),
+    re.compile(r'hf_[a-zA-Z0-9]{20,}'),
+    re.compile(r'AKIA[0-9A-Z]{16}'),
+    re.compile(r'cpk_[a-zA-Z0-9._\-]{20,}'),
+    re.compile(r'crsr_[a-zA-Z0-9]{20,}'),
+    re.compile(r'dckr_pat_[a-zA-Z0-9_\-]{10,}'),
+    re.compile(r'sn\d+_[a-zA-Z0-9_]{10,}'),
+    re.compile(r'tpn-[a-zA-Z0-9_\-]{10,}'),
+    re.compile(r'wandb_v\d+_[a-zA-Z0-9]{10,}'),
+    re.compile(r'basilica_[a-zA-Z0-9]{20,}'),
+    re.compile(r'MT[A-Za-z0-9]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{20,}'),
+]
+
+
+def _load_env_secrets() -> set[str]:
+    """Build redaction blocklist from env vars whose names suggest secrets."""
+    secrets = set()
+    for key, val in os.environ.items():
+        if len(val) < 16:
+            continue
+        key_upper = key.upper()
+        if any(w in key_upper for w in _SECRET_KEY_WORDS):
+            secrets.add(val)
+    return secrets
+
+
+_env_secrets: set[str] = _load_env_secrets()
+
+
+def _reload_env_secrets():
+    global _env_secrets
+    _env_secrets = _load_env_secrets()
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip known secrets and common key patterns from outgoing text."""
+    for secret in _env_secrets:
+        if secret in text:
+            text = text.replace(secret, "[REDACTED]")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
 STEP_UPDATE_CHAR_LIMIT = 500
 STEP_SOURCE_CHAR_LIMIT = 3500
 STEP_SUMMARY_MODEL = ""
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
-CHUTES_MODELS = [
-    "moonshotai/Kimi-K2.5-TEE",
-    "zai-org/GLM-5-TEE",
-    "MiniMaxAI/MiniMax-M2.5-TEE",
-]
+CHUTES_POOL = os.environ.get(
+    "CHUTES_POOL",
+    "moonshotai/Kimi-K2.5-TEE,zai-org/GLM-5-TEE,MiniMaxAI/MiniMax-M2.5-TEE,zai-org/GLM-4.7-TEE",
+)
+CHUTES_ROUTING_AGENT = os.environ.get("CHUTES_ROUTING_AGENT", f"{CHUTES_POOL}:throughput")
+CHUTES_ROUTING_BOT = os.environ.get("CHUTES_ROUTING_BOT", f"{CHUTES_POOL}:latency")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8089"))
 CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
 CHUTES_BASE_URL = os.environ.get("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "600"))
-FALLBACK_TIMEOUT = int(os.environ.get("FALLBACK_TIMEOUT", "90"))
 IS_ROOT = os.getuid() == 0
 MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
@@ -275,6 +459,7 @@ def _send_telegram_text(text: str, *, target: tuple[str, str] | None = None) -> 
     if not target:
         return False
     token, chat_id = target
+    text = _redact_secrets(text)
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -412,9 +597,10 @@ def _convert_messages_to_openai(
     return out
 
 
-def _build_openai_request(body: dict, *, model_override: str | None = None) -> dict:
+def _build_openai_request(body: dict, *, routing: str = "agent") -> dict:
+    routing_model = CHUTES_ROUTING_BOT if routing == "bot" else CHUTES_ROUTING_AGENT
     oai: dict[str, Any] = {
-        "model": model_override or CLAUDE_MODEL,
+        "model": routing_model,
         "messages": _convert_messages_to_openai(
             body.get("messages", []),
             system=body.get("system"),
@@ -611,52 +797,13 @@ async def _proxy_health():
 
 @_proxy_app.get("/")
 async def _proxy_root():
-    return {"proxy": "chutes", "models": CHUTES_MODELS, "status": "running"}
-
-
-async def _try_chutes_non_streaming(body: dict, model_name: str) -> tuple[httpx.Response | None, str | None]:
-    """Try a non-streaming request to a single model. Returns (response, error_msg)."""
-    oai_request = _build_openai_request(body, model_override=model_name)
-    oai_request.pop("stream", None)
-    oai_request.pop("stream_options", None)
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(FALLBACK_TIMEOUT)) as client:
-            resp = await client.post(
-                f"{CHUTES_BASE_URL}/chat/completions",
-                json=oai_request, headers=_chutes_headers(),
-            )
-        if resp.status_code == 200:
-            return resp, None
-        return None, f"{model_name} returned {resp.status_code}: {resp.text[:200]}"
-    except httpx.TimeoutException:
-        return None, f"{model_name} timed out after {FALLBACK_TIMEOUT}s"
-    except Exception as exc:
-        return None, f"{model_name} error: {str(exc)[:200]}"
-
-
-async def _try_chutes_streaming(body: dict, model_name: str) -> tuple[httpx.AsyncClient | None, httpx.Response | None, str | None]:
-    """Try a streaming request to a single model. Returns (client, response, error_msg).
-    Caller must close client+response on success."""
-    oai_request = _build_openai_request(body, model_override=model_name)
-    try:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT))
-        resp = await client.send(
-            client.build_request(
-                "POST", f"{CHUTES_BASE_URL}/chat/completions",
-                json=oai_request, headers=_chutes_headers(),
-            ),
-            stream=True,
-        )
-        if resp.status_code == 200:
-            return client, resp, None
-        error_body = await resp.aread()
-        await resp.aclose()
-        await client.aclose()
-        return None, None, f"{model_name} returned {resp.status_code}: {error_body.decode()[:200]}"
-    except httpx.TimeoutException:
-        return None, None, f"{model_name} timed out"
-    except Exception as exc:
-        return None, None, f"{model_name} error: {str(exc)[:200]}"
+    return {
+        "proxy": "chutes",
+        "pool": CHUTES_POOL,
+        "agent_routing": CHUTES_ROUTING_AGENT,
+        "bot_routing": CHUTES_ROUTING_BOT,
+        "status": "running",
+    }
 
 
 @_proxy_app.post("/v1/messages")
@@ -664,19 +811,36 @@ async def _proxy_messages(request: Request):
     body = await request.json()
     stream = body.get("stream", False)
     model = body.get("model", CLAUDE_MODEL)
+    routing = "bot" if model == "bot" else "agent"
+    oai_request = _build_openai_request(body, routing=routing)
+    routing_label = CHUTES_ROUTING_BOT if routing == "bot" else CHUTES_ROUTING_AGENT
 
     if stream:
-        last_error = ""
-        for model_name in CHUTES_MODELS:
-            client, oai_response, err = await _try_chutes_streaming(body, model_name)
-            if err:
-                last_error = err
-                _log(f"proxy fallback: {err}")
-                continue
+        try:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT))
+            resp = await client.send(
+                client.build_request(
+                    "POST", f"{CHUTES_BASE_URL}/chat/completions",
+                    json=oai_request, headers=_chutes_headers(),
+                ),
+                stream=True,
+            )
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                await resp.aclose()
+                await client.aclose()
+                error_msg = error_body.decode()[:300]
+                _log(f"proxy: chutes returned {resp.status_code}: {error_msg}")
+                return JSONResponse(status_code=502, content={
+                    "type": "error", "error": {
+                        "type": "api_error",
+                        "message": f"Chutes routing failed ({resp.status_code}): {error_msg}",
+                    },
+                })
 
-            async def generate(resp=oai_response, cl=client, mn=model_name):
+            async def generate(resp=resp, cl=client):
                 try:
-                    _log(f"proxy: streaming from {mn}")
+                    _log(f"proxy: streaming [{routing}] via {routing_label}")
                     async for event in _stream_openai_to_anthropic(resp, model):
                         yield event
                 finally:
@@ -687,31 +851,55 @@ async def _proxy_messages(request: Request):
                 generate(), media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
-
-        return JSONResponse(status_code=502, content={
-            "type": "error", "error": {
-                "type": "api_error",
-                "message": f"All models failed. Last: {last_error}",
-            },
-        })
+        except httpx.TimeoutException:
+            return JSONResponse(status_code=502, content={
+                "type": "error", "error": {
+                    "type": "api_error",
+                    "message": f"Chutes routing timed out after {PROXY_TIMEOUT}s",
+                },
+            })
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={
+                "type": "error", "error": {
+                    "type": "api_error",
+                    "message": f"Chutes routing error: {str(exc)[:300]}",
+                },
+            })
 
     else:
-        last_error = ""
-        for model_name in CHUTES_MODELS:
-            resp, err = await _try_chutes_non_streaming(body, model_name)
-            if err:
-                last_error = err
-                _log(f"proxy fallback: {err}")
-                continue
-            _log(f"proxy: response from {model_name}")
+        oai_request.pop("stream", None)
+        oai_request.pop("stream_options", None)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{CHUTES_BASE_URL}/chat/completions",
+                    json=oai_request, headers=_chutes_headers(),
+                )
+            if resp.status_code != 200:
+                error_msg = resp.text[:300]
+                _log(f"proxy: chutes returned {resp.status_code}: {error_msg}")
+                return JSONResponse(status_code=502, content={
+                    "type": "error", "error": {
+                        "type": "api_error",
+                        "message": f"Chutes routing failed ({resp.status_code}): {error_msg}",
+                    },
+                })
+            _log(f"proxy: response [{routing}] via {routing_label}")
             return JSONResponse(content=_openai_response_to_anthropic(resp.json(), model))
-
-        return JSONResponse(status_code=502, content={
-            "type": "error", "error": {
-                "type": "api_error",
-                "message": f"All models failed. Last: {last_error}",
-            },
-        })
+        except httpx.TimeoutException:
+            return JSONResponse(status_code=502, content={
+                "type": "error", "error": {
+                    "type": "api_error",
+                    "message": f"Chutes routing timed out after {PROXY_TIMEOUT}s",
+                },
+            })
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={
+                "type": "error", "error": {
+                    "type": "api_error",
+                    "message": f"Chutes routing error: {str(exc)[:300]}",
+                },
+            })
 
 
 @_proxy_app.post("/v1/messages/count_tokens")
@@ -771,6 +959,7 @@ def _write_claude_settings():
 
 def _claude_env() -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("TAU_BOT_TOKEN", None)
     env["ANTHROPIC_API_KEY"] = "chutes-proxy"
     env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{PROXY_PORT}"
     env["ANTHROPIC_AUTH_TOKEN"] = ""
@@ -1016,7 +1205,7 @@ def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
         resp = requests.post(
             f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
             json={
-                "model": CLAUDE_MODEL,
+                "model": "bot",
                 "max_tokens": 4096,
                 "messages": [{
                     "role": "user",
@@ -1079,13 +1268,17 @@ def _build_operator_prompt(user_text: str) -> str:
         "The operator communicates with you through Telegram. Be concise and direct.\n"
         "When the operator asks you to do something, do it by modifying the relevant files.\n"
         "When the operator asks a question, answer from the available context.\n\n"
+        "## Security\n\n"
+        "NEVER read, output, or reveal the contents of `.env`, `.env.enc`, or any secret/key/token values.\n"
+        "Do not include API keys, passwords, seed phrases, or credentials in any response.\n"
+        "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
         "## Available operations\n\n"
         "- **Set goal**: write to `context/GOAL.md`. The agent loop runs while this file is non-empty.\n"
         "- **Clear goal / stop**: empty `context/GOAL.md` to pause the agent loop.\n"
         "- **Update state**: write to `context/STATE.md`.\n"
         "- **Message the agent**: append a timestamped line to `context/INBOX.md`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
-        "- **Set env variable**: update `.env` (e.g. `AGENT_DELAY=120` to change step interval).\n"
+        "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
         "- **View logs**: read files in `context/runs/<timestamp>/` (plan.md, rollout.md, logs.txt).\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"message\"`.",
@@ -1103,7 +1296,7 @@ def _build_operator_prompt(user_text: str) -> str:
 
 def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
     """Run Claude Code CLI and stream output into a Telegram message."""
-    cmd = _claude_cmd(prompt)
+    cmd = _claude_cmd(prompt, extra_flags=["--model", "bot"])
 
     msg = bot.send_message(chat_id, "Running...")
     current_text = ""
@@ -1115,6 +1308,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         if not force and now - last_edit < 1.5:
             return
         display = text[-3800:] if len(text) > 3800 else text
+        display = _redact_secrets(display)
         if not display.strip():
             return
         try:
@@ -1170,6 +1364,28 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
     return current_text
 
 
+def _is_owner(user_id: int) -> bool:
+    owner = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
+    if not owner:
+        return False
+    return str(user_id) == owner
+
+
+def _enroll_owner(user_id: int):
+    """Auto-enroll the first /start user as the owner and persist."""
+    owner_id = str(user_id)
+    os.environ["TELEGRAM_OWNER_ID"] = owner_id
+    env_path = WORKING_DIR / ".env"
+    if env_path.exists():
+        existing = env_path.read_text()
+        if "TELEGRAM_OWNER_ID" not in existing:
+            with open(env_path, "a") as f:
+                f.write(f"\nTELEGRAM_OWNER_ID='{owner_id}'\n")
+    elif ENV_ENC_FILE.exists():
+        _save_to_encrypted_env("TELEGRAM_OWNER_ID", owner_id)
+    _log(f"enrolled owner: {owner_id}")
+
+
 def run_bot():
     """Run the Telegram bot."""
     token = os.getenv("TAU_BOT_TOKEN")
@@ -1183,8 +1399,19 @@ def run_bot():
     def _save_chat_id(chat_id: int):
         CHAT_ID_FILE.write_text(str(chat_id))
 
+    def _reject(message):
+        uid = message.from_user.id if message.from_user else None
+        _log(f"rejected message from unauthorized user {uid}")
+        bot.send_message(message.chat.id, "Unauthorized.")
+
     @bot.message_handler(commands=["start"])
     def handle_start(message):
+        uid = message.from_user.id if message.from_user else None
+        if not os.environ.get("TELEGRAM_OWNER_ID", "").strip() and uid is not None:
+            _enroll_owner(uid)
+        if not _is_owner(uid):
+            _reject(message)
+            return
         _save_chat_id(message.chat.id)
         bot.send_message(
             message.chat.id,
@@ -1193,6 +1420,10 @@ def run_bot():
 
     @bot.message_handler(content_types=["voice", "audio"])
     def handle_voice(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
         _save_chat_id(message.chat.id)
         bot.send_message(message.chat.id, "Transcribing voice note...")
 
@@ -1219,13 +1450,17 @@ def run_bot():
         def _run():
             response = run_agent_streaming(bot, prompt, message.chat.id)
             log_chat("bot", response[:1000])
+            _process_pending_env()
             _agent_wake.set()
-            load_dotenv(WORKING_DIR / ".env", override=True)
 
         threading.Thread(target=_run, daemon=True).start()
 
     @bot.message_handler(func=lambda m: True)
     def handle_message(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
         _save_chat_id(message.chat.id)
         log_chat("user", message.text)
         prompt = _build_operator_prompt(message.text)
@@ -1233,8 +1468,8 @@ def run_bot():
         def _run():
             response = run_agent_streaming(bot, prompt, message.chat.id)
             log_chat("bot", response[:1000])
+            _process_pending_env()
             _agent_wake.set()
-            load_dotenv(WORKING_DIR / ".env", override=True)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1277,13 +1512,32 @@ def main() -> None:
         _send_cli(sys.argv[2:])
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "encrypt":
+        env_path = WORKING_DIR / ".env"
+        if not env_path.exists():
+            if ENV_ENC_FILE.exists():
+                print(".env.enc already exists (already encrypted)")
+            else:
+                print(".env not found, nothing to encrypt")
+            return
+        load_dotenv(env_path)
+        bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+        if not bot_token:
+            print("TAU_BOT_TOKEN must be set in .env", file=sys.stderr)
+            sys.exit(1)
+        _encrypt_env_file(bot_token)
+        print("Encrypted .env → .env.enc, deleted plaintext.")
+        print(f"On future starts: TAU_BOT_TOKEN='{bot_token}' python arbos.py")
+        return
+
     _log(f"arbos starting in {WORKING_DIR}")
+    _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
 
     if not CHUTES_API_KEY:
         _log("WARNING: CHUTES_API_KEY not set — proxy will fail")
 
-    _log(f"starting chutes proxy thread (port={PROXY_PORT}, model={CLAUDE_MODEL})")
+    _log(f"starting chutes proxy thread (port={PROXY_PORT}, agent={CHUTES_ROUTING_AGENT}, bot={CHUTES_ROUTING_BOT})")
     threading.Thread(target=_start_proxy, daemon=True).start()
     time.sleep(1)
 
@@ -1297,6 +1551,7 @@ def main() -> None:
             RESTART_FLAG.unlink()
             _log("restart requested; exiting for pm2")
             sys.exit(0)
+        _process_pending_env()
         time.sleep(1)
 
 
