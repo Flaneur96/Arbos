@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -126,38 +127,39 @@ def _init_env():
 
 def _process_pending_env():
     """Pick up env vars the operator agent wrote to .env.pending and persist them."""
-    if not ENV_PENDING_FILE.exists():
-        return
-    content = ENV_PENDING_FILE.read_text().strip()
-    ENV_PENDING_FILE.unlink(missing_ok=True)
-    if not content:
-        return
+    with _pending_env_lock:
+        if not ENV_PENDING_FILE.exists():
+            return
+        content = ENV_PENDING_FILE.read_text().strip()
+        ENV_PENDING_FILE.unlink(missing_ok=True)
+        if not content:
+            return
 
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k, v = k.strip(), v.strip().strip("'\"")
-        os.environ[k] = v
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("'\"")
+            os.environ[k] = v
 
-    env_path = WORKING_DIR / ".env"
-    if env_path.exists():
-        with open(env_path, "a") as f:
-            f.write("\n" + content + "\n")
-    elif ENV_ENC_FILE.exists():
-        bot_token = os.environ.get("TAU_BOT_TOKEN", "")
-        if bot_token:
-            try:
-                existing = _decrypt_env_content(bot_token)
-            except InvalidToken:
-                existing = ""
-            new_content = existing.rstrip() + "\n" + content + "\n"
-            enc = Fernet(_derive_fernet_key(bot_token))
-            ENV_ENC_FILE.write_bytes(enc.encrypt(new_content.encode()))
+        env_path = WORKING_DIR / ".env"
+        if env_path.exists():
+            with open(env_path, "a") as f:
+                f.write("\n" + content + "\n")
+        elif ENV_ENC_FILE.exists():
+            bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+            if bot_token:
+                try:
+                    existing = _decrypt_env_content(bot_token)
+                except InvalidToken:
+                    existing = ""
+                new_content = existing.rstrip() + "\n" + content + "\n"
+                enc = Fernet(_derive_fernet_key(bot_token))
+                ENV_ENC_FILE.write_bytes(enc.encrypt(new_content.encode()))
 
-    _reload_env_secrets()
-    _log(f"loaded pending env vars from .env.pending")
+        _reload_env_secrets()
+        _log(f"loaded pending env vars from .env.pending")
 
 
 _init_env()
@@ -235,8 +237,12 @@ MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 _log_fh = None
 _log_lock = threading.Lock()
+_chatlog_lock = threading.Lock()
+_pending_env_lock = threading.Lock()
 _agent_wake = threading.Event()
+_shutdown = threading.Event()
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
+_step_count = 0
 
 
 def _file_log(msg: str):
@@ -300,27 +306,28 @@ def make_run_dir() -> Path:
 
 def log_chat(role: str, text: str):
     """Append to chatlog, rolling to a new file when size exceeds limit."""
-    CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
-    max_file_size = 4000
-    max_files = 50
+    with _chatlog_lock:
+        CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
+        max_file_size = 4000
+        max_files = 50
 
-    existing = sorted(CHATLOG_DIR.glob("*.jsonl"))
+        existing = sorted(CHATLOG_DIR.glob("*.jsonl"))
 
-    current: Path | None = None
-    if existing and existing[-1].stat().st_size < max_file_size:
-        current = existing[-1]
+        current: Path | None = None
+        if existing and existing[-1].stat().st_size < max_file_size:
+            current = existing[-1]
 
-    if current is None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        current = CHATLOG_DIR / f"{ts}.jsonl"
+        if current is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            current = CHATLOG_DIR / f"{ts}.jsonl"
 
-    entry = json.dumps({"role": role, "text": text[:1000], "ts": datetime.now().isoformat()})
-    with open(current, "a", encoding="utf-8") as f:
-        f.write(entry + "\n")
+        entry = json.dumps({"role": role, "text": text[:1000], "ts": datetime.now().isoformat()})
+        with open(current, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
 
-    all_files = sorted(CHATLOG_DIR.glob("*.jsonl"))
-    for old in all_files[:-max_files]:
-        old.unlink(missing_ok=True)
+        all_files = sorted(CHATLOG_DIR.glob("*.jsonl"))
+        for old in all_files[:-max_files]:
+            old.unlink(missing_ok=True)
 
 
 def load_chatlog(max_chars: int = 8000) -> str:
@@ -685,6 +692,7 @@ async def _stream_openai_to_anthropic(oai_response: httpx.Response, model: str):
     tool_calls_accum: dict[int, dict] = {}
     stop_reason = "end_turn"
     usage = {"input_tokens": 0, "output_tokens": 0}
+    logged_stream_model = False
 
     async for line in oai_response.aiter_lines():
         if not line.startswith("data: "):
@@ -696,6 +704,10 @@ async def _stream_openai_to_anthropic(oai_response: httpx.Response, model: str):
             chunk = json.loads(data_str)
         except json.JSONDecodeError:
             continue
+
+        if not logged_stream_model and chunk.get("model"):
+            _log(f"proxy: stream model={chunk['model']}")
+            logged_stream_model = True
 
         if chunk.get("usage"):
             u = chunk["usage"]
@@ -884,8 +896,10 @@ async def _proxy_messages(request: Request):
                         "message": f"Chutes routing failed ({resp.status_code}): {error_msg}",
                     },
                 })
-            _log(f"proxy: response [{routing}] via {routing_label}")
-            return JSONResponse(content=_openai_response_to_anthropic(resp.json(), model))
+            oai_data = resp.json()
+            actual_model = oai_data.get("model", "?")
+            _log(f"proxy: response [{routing}] via {routing_label} model={actual_model}")
+            return JSONResponse(content=_openai_response_to_anthropic(oai_data, model))
         except httpx.TimeoutException:
             return JSONResponse(status_code=502, content={
                 "type": "error", "error": {
@@ -1061,6 +1075,8 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
         env = _claude_env()
         flags = " ".join(a for a in cmd if a.startswith("-"))
 
+        returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
+
         for attempt in range(1, MAX_RETRIES + 1):
             _log(f"{phase}: starting (attempt={attempt}) flags=[{flags}]")
             t0 = time.monotonic()
@@ -1170,17 +1186,16 @@ def run_step(prompt: str, step_number: int) -> bool:
 # ── Agent loop ───────────────────────────────────────────────────────────────
 
 def agent_loop():
-    step_count = 0
+    global _step_count
     failures = 0
 
     while True:
         if not GOAL_FILE.exists() or not GOAL_FILE.read_text().strip():
             _agent_wake.wait(timeout=5)
-            _agent_wake.clear()
             continue
 
-        step_count += 1
-        _log(f"Step {step_count}", blank=True)
+        _step_count += 1
+        _log(f"Step {_step_count}", blank=True)
 
         prompt = load_prompt(consume_inbox=True)
         if not prompt:
@@ -1188,7 +1203,7 @@ def agent_loop():
 
         _log(f"prompt={len(prompt)} chars")
 
-        success = run_step(prompt, step_count)
+        success = run_step(prompt, _step_count)
 
         if success:
             failures = 0
@@ -1196,39 +1211,35 @@ def agent_loop():
             failures += 1
             _log(f"failure #{failures}")
 
+        _agent_wake.clear()
         delay = int(os.environ.get("AGENT_DELAY", "60"))
         effective_delay = delay + min(2 ** failures, 120) * (1 if failures else 0)
         _agent_wake.wait(timeout=effective_delay)
-        _agent_wake.clear()
 
 
 def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
-    """Transcribe audio by sending it through the Chutes proxy (Anthropic Messages API)."""
+    """Transcribe audio via Chutes Whisper Large V3 STT endpoint."""
     try:
         with open(file_path, "rb") as f:
             b64_audio = base64.b64encode(f.read()).decode("utf-8")
 
         resp = requests.post(
-            f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
-            json={
-                "model": "bot",
-                "max_tokens": 4096,
-                "messages": [{
-                    "role": "user",
-                    "content": (
-                        "The user sent a voice note. The audio has been attached but you may not be able "
-                        "to process it directly. If you can read audio, transcribe it exactly. Otherwise, "
-                        "reply with: (voice note received but transcription unavailable)"
-                    ),
-                }],
+            "https://chutes-whisper-large-v3.chutes.ai/transcribe",
+            headers={
+                "Authorization": f"Bearer {CHUTES_API_KEY}",
+                "Content-Type": "application/json",
             },
+            json={"language": None, "audio_b64": b64_audio},
             timeout=90,
         )
         if resp.status_code == 200:
             data = resp.json()
-            text = data.get("content", [{}])[0].get("text", "")
+            text = data.get("text", "") if isinstance(data, dict) else str(data)
             if text.strip():
+                _log(f"whisper transcription ok ({len(text)} chars)")
                 return text.strip()
+            return "(voice transcription returned empty — send text instead)"
+        _log(f"whisper STT failed: status={resp.status_code} body={resp.text[:200]}")
         return "(voice transcription unavailable — send text instead)"
     except Exception as exc:
         _log(f"transcription failed: {str(exc)[:200]}")
@@ -1454,6 +1465,90 @@ def run_bot():
             "Give me a goal and I'll work on it. You can also send me messages to update the goal, state, or inbox.",
         )
 
+    @bot.message_handler(commands=["status"])
+    def handle_status(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        goal = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else "(none)"
+        active = bool(goal and goal != "(none)")
+        last_run = ""
+        if RUNS_DIR.exists():
+            dirs = sorted([d for d in RUNS_DIR.iterdir() if d.is_dir()], key=lambda d: d.name)
+            if dirs:
+                last_run = dirs[-1].name
+        lines = [
+            f"Steps completed: {_step_count}",
+            f"Loop active: {'yes' if active else 'no (goal empty)'}",
+            f"Last run: {last_run or 'none'}",
+            f"Goal: {goal[:300]}",
+        ]
+        bot.send_message(message.chat.id, "\n".join(lines))
+
+    @bot.message_handler(commands=["stop"])
+    def handle_stop(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        GOAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GOAL_FILE.write_text("")
+        bot.send_message(message.chat.id, "Goal cleared. Agent loop paused.")
+        _log("goal cleared via /stop command")
+
+    @bot.message_handler(commands=["goal"])
+    def handle_goal(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        text = (message.text or "").split(None, 1)
+        if len(text) < 2 or not text[1].strip():
+            bot.send_message(message.chat.id, "Usage: /goal <your goal text>")
+            return
+        goal_text = text[1].strip()
+        GOAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GOAL_FILE.write_text(goal_text)
+        _agent_wake.set()
+        bot.send_message(message.chat.id, f"Goal set ({len(goal_text)} chars). Agent loop will pick it up.")
+        _log(f"goal set via /goal command ({len(goal_text)} chars)")
+
+    @bot.message_handler(commands=["clear"])
+    def handle_clear(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        import shutil
+        removed = []
+        if CONTEXT_DIR.exists():
+            shutil.rmtree(CONTEXT_DIR)
+            removed.append("context/")
+        try:
+            r = subprocess.run(
+                ["git", "checkout", "HEAD", "--", "."],
+                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                removed.append("git checkout (restored tracked files)")
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(
+                ["git", "clean", "-fd", "--exclude=.env*", "--exclude=chat_id.txt",
+                 "--exclude=.venv", "--exclude=__pycache__", "--exclude=.claude"],
+                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                removed.append(f"git clean ({len(r.stdout.splitlines())} items)")
+        except Exception:
+            pass
+        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        summary = ", ".join(removed) if removed else "nothing to clear"
+        bot.send_message(message.chat.id, f"Cleared: {summary}\nReady for a fresh /goal.")
+        _log(f"cleared via /clear command: {summary}")
+
     @bot.message_handler(content_types=["voice", "audio"])
     def handle_voice(message):
         uid = message.from_user.id if message.from_user else None
@@ -1463,7 +1558,8 @@ def run_bot():
         _save_chat_id(message.chat.id)
         bot.send_message(message.chat.id, "Transcribing voice note...")
 
-        file_info = bot.get_file(message.voice.file_id if message.voice else message.audio.file_id)
+        voice_or_audio = message.voice or message.audio
+        file_info = bot.get_file(voice_or_audio.file_id)
         downloaded = bot.download_file(file_info.file_path)
 
         ext = file_info.file_path.rsplit(".", 1)[-1] if "." in file_info.file_path else "ogg"
@@ -1573,6 +1669,12 @@ def main() -> None:
     if not CHUTES_API_KEY:
         _log("WARNING: CHUTES_API_KEY not set — proxy will fail")
 
+    def _handle_sigterm(signum, frame):
+        _log("SIGTERM received; shutting down gracefully")
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     _log(f"starting chutes proxy thread (port={PROXY_PORT}, agent={CHUTES_ROUTING_AGENT}, bot={CHUTES_ROUTING_BOT})")
     threading.Thread(target=_start_proxy, daemon=True).start()
     time.sleep(1)
@@ -1582,13 +1684,16 @@ def main() -> None:
     threading.Thread(target=agent_loop, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
 
-    while True:
+    while not _shutdown.is_set():
         if RESTART_FLAG.exists():
             RESTART_FLAG.unlink()
             _log("restart requested; exiting for pm2")
             sys.exit(0)
         _process_pending_env()
-        time.sleep(1)
+        _shutdown.wait(timeout=1)
+
+    _log("shutdown complete")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

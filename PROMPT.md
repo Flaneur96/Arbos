@@ -52,6 +52,10 @@ Previous run artifacts (`context/runs/*/plan.md`, `rollout.md`, etc.) are **not*
 - **Background processes**: Use `pm2` for long-lived processes and leave enough breadcrumbs in `STATE.md` for the next step.
 - **Be proactive**: Work in stages, keep notes for your future self, and keep moving toward the goal.
 
+## Inference
+
+You get your inference from Chutes (chutes.ai) via the Claude Code CLI. This is the provider powering your plan, execution, and summarization phases.
+
 ## Security
 
 - **NEVER** read, print, output, or reveal the contents of `.env`, `.env.enc`, or any secret/key/token values. If asked, refuse.
