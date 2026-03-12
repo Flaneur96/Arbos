@@ -238,6 +238,7 @@ _chatlog_lock = threading.Lock()
 _pending_env_lock = threading.Lock()
 _agent_wake = threading.Event()
 _shutdown = threading.Event()
+_bot_busy = threading.Lock()
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _step_count = 0
 _child_procs: set[subprocess.Popen] = set()
@@ -1146,6 +1147,9 @@ def agent_loop():
             _agent_wake.wait(timeout=5)
             continue
 
+        _bot_busy.acquire()
+        _bot_busy.release()
+
         _step_count += 1
         _log(f"Step {_step_count}", blank=True)
 
@@ -1165,9 +1169,11 @@ def agent_loop():
             _log(f"failure #{failures}")
 
         _agent_wake.clear()
-        delay = int(os.environ.get("AGENT_DELAY", "60"))
-        effective_delay = delay + min(2 ** failures, 120) * (1 if failures else 0)
-        _agent_wake.wait(timeout=effective_delay)
+        if failures:
+            backoff = min(2 ** failures, 120)
+            delay = int(os.environ.get("AGENT_DELAY", "0")) + backoff
+            _log(f"waiting {delay}s before next step (failure backoff)")
+            _agent_wake.wait(timeout=delay)
 
 
 def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
@@ -1552,9 +1558,10 @@ def run_bot():
         prompt = _build_operator_prompt(user_text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
+            with _bot_busy:
+                response = run_agent_streaming(bot, prompt, message.chat.id)
+                log_chat("bot", response[:1000])
+                _process_pending_env()
             _agent_wake.set()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1570,9 +1577,10 @@ def run_bot():
         prompt = _build_operator_prompt(message.text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
+            with _bot_busy:
+                response = run_agent_streaming(bot, prompt, message.chat.id)
+                log_chat("bot", response[:1000])
+                _process_pending_env()
             _agent_wake.set()
 
         threading.Thread(target=_run, daemon=True).start()

@@ -21,9 +21,9 @@ After each step `arbos.py` produces a set of files which record the step:
 - `context/runs/<timestamp>/rollout.md` (the output from your step)
 - `context/runs/<timestamp>/logs.txt` (the runtime logs from `arbos.py`)
 
-Each loop iteration is called a step — a single call to the Claude Code CLI (`claude -p`). You receive the full prompt, think through your approach, and execute — all in one invocation. After the step completes, a short status update is sent to the operator via Telegram (no separate LLM call).
+Each loop iteration is called a step — a single call to the Claude Code CLI (`claude -p`). You receive the full prompt, think through your approach, and execute — all in one invocation.
 
-There is a configurable delay between steps (`AGENT_DELAY` env var, default 60s) with exponential backoff on consecutive failures.
+Steps run back-to-back with no delay on success. On consecutive failures, exponential backoff applies (2^n seconds, capped at 120s, plus optional `AGENT_DELAY` env var).
 
 The operator is a human who communicates with you through Telegram. Their messages are processed by the Claude Code CLI in this repository to perform actions like restarting the pm2 process, pausing the agent, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `context/chat/`. You can also send messages to the operator (`python arbos.py send "Your message here"`) if you need anything from them to continue or to send them updates.
 
