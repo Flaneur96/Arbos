@@ -14,6 +14,23 @@ from typing import Any
 
 import re
 
+# Ensure TLS certs are available before importing requests/httpx.
+# The Claude Code agent loop may reinstall packages and break certifi.
+if not os.environ.get("REQUESTS_CA_BUNDLE"):
+    try:
+        import certifi
+        _ca = certifi.where()
+        if not Path(_ca).is_file():
+            raise FileNotFoundError
+    except Exception:
+        for _ca in ("/etc/ssl/certs/ca-certificates.crt",
+                     "/etc/pki/tls/certs/ca-bundle.crt",
+                     "/etc/ssl/cert.pem"):
+            if Path(_ca).is_file():
+                os.environ["REQUESTS_CA_BUNDLE"] = _ca
+                os.environ["SSL_CERT_FILE"] = _ca
+                break
+
 from dotenv import load_dotenv
 import httpx
 import requests

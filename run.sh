@@ -310,6 +310,21 @@ export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.npm-global/bin:/usr/loc
 cd "$INSTALL_DIR"
 set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate
+
+# Ensure TLS certs are available — fallback to system bundle if certifi is broken
+if [ -z "\$REQUESTS_CA_BUNDLE" ]; then
+    CERTIFI_PATH="\$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null)"
+    if [ -z "\$CERTIFI_PATH" ] || [ ! -f "\$CERTIFI_PATH" ]; then
+        for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+            if [ -f "\$ca" ]; then
+                export REQUESTS_CA_BUNDLE="\$ca"
+                export SSL_CERT_FILE="\$ca"
+                break
+            fi
+        done
+    fi
+fi
+
 exec python3 arbos.py 2>&1
 LAUNCH
 chmod +x "$LAUNCH_SCRIPT"
