@@ -248,6 +248,16 @@ if PROVIDER == "openrouter":
     COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "25.00"))
     CHUTES_ROUTING_AGENT = CLAUDE_MODEL
     CHUTES_ROUTING_BOT = CLAUDE_MODEL
+elif PROVIDER == "nvidia":
+    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "z-ai/glm5")
+    CHUTES_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+    LLM_BASE_URL = CHUTES_BASE_URL
+    CHUTES_POOL = ""
+    CHUTES_ROUTING_AGENT = os.environ.get("NVIDIA_MODEL", "z-ai/glm5")
+    CHUTES_ROUTING_BOT = os.environ.get("NVIDIA_MODEL", "z-ai/glm5")
+    COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "0.00"))
+    COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "0.00"))
 else:
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
     CHUTES_BASE_URL = os.environ.get("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
@@ -1992,7 +2002,7 @@ def main() -> None:
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
 
     if not LLM_API_KEY:
-        key_name = "OPENROUTER_API_KEY" if PROVIDER == "openrouter" else "CHUTES_API_KEY"
+        key_name = {"openrouter": "OPENROUTER_API_KEY", "nvidia": "NVIDIA_API_KEY"}.get(PROVIDER, "CHUTES_API_KEY")
         _log(f"WARNING: {key_name} not set — LLM calls will fail")
 
     def _handle_sigterm(signum, frame):
@@ -2001,12 +2011,12 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    if PROVIDER != "openrouter":
-        _log(f"starting chutes proxy thread (port={PROXY_PORT}, agent={CHUTES_ROUTING_AGENT}, bot={CHUTES_ROUTING_BOT})")
+    if PROVIDER == "openrouter":
+        _log(f"openrouter direct mode — no proxy needed (target={LLM_BASE_URL})")
+    else:
+        _log(f"starting proxy thread (port={PROXY_PORT}, provider={PROVIDER}, agent={CHUTES_ROUTING_AGENT}, bot={CHUTES_ROUTING_BOT})")
         threading.Thread(target=_start_proxy, daemon=True).start()
         time.sleep(1)
-    else:
-        _log(f"openrouter direct mode — no proxy needed (target={LLM_BASE_URL})")
 
     _write_claude_settings()
 
