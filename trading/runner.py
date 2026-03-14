@@ -337,7 +337,11 @@ class TradingRunner:
             await self._evolve_models()
 
         # Save state
-        await self._save_state()
+        try:
+            await self._save_state()
+            print(f"DEBUG: State saved, positions: {len(self._positions)}")
+        except Exception as e:
+            print(f"ERROR saving state: {e}")
 
         step_end = datetime.now(timezone.utc)
         step_duration = (step_end - step_start).total_seconds()
