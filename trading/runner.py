@@ -564,13 +564,21 @@ class TradingRunner:
 
         for symbol, preds in predictions.items():
             if not preds:
+                print(f"DEBUG: {symbol} - no predictions")
                 continue
 
             # Combine predictions using horizon ensemble
             ensemble_pred = self._horizon_ensemble.combine_predictions(preds)
 
+            # Debug log - prediction distribution
+            up_votes = sum(1 for p in preds if p.direction > 0)
+            down_votes = sum(1 for p in preds if p.direction < 0)
+            neutral_votes = sum(1 for p in preds if p.direction == 0)
+            print(f"DEBUG: {symbol} - preds={len(preds)}, up={up_votes}, down={down_votes}, neutral={neutral_votes}, consensus={ensemble_pred.consensus_strength:.2f}")
+
             # Check consensus strength
             if ensemble_pred.consensus_strength < self.config.min_consensus_strength:
+                print(f"DEBUG: {symbol} - filtered (consensus {ensemble_pred.consensus_strength:.2f} < {self.config.min_consensus_strength})")
                 continue
 
             # Check direction agreement
@@ -578,6 +586,7 @@ class TradingRunner:
             direction_agreement = direction_votes / len(preds) if preds else 0
 
             if direction_agreement < self.config.min_direction_agreement:
+                print(f"DEBUG: {symbol} - filtered (direction_agreement {direction_agreement:.2f} < {self.config.min_direction_agreement})")
                 continue
 
             # Create signal
