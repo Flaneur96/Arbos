@@ -519,9 +519,9 @@ class TradingRunner:
                             predicted_return *= 0.8
 
                     # Determine direction
-                    if predicted_return > 0.005:
+                    if predicted_return > 0.001:
                         direction = 1
-                    elif predicted_return < -0.005:
+                    elif predicted_return < -0.001:
                         direction = -1
                     else:
                         direction = 0
@@ -581,9 +581,13 @@ class TradingRunner:
                 print(f"DEBUG: {symbol} - filtered (consensus {ensemble_pred.consensus_strength:.2f} < {self.config.min_consensus_strength})")
                 continue
 
-            # Check direction agreement
-            direction_votes = sum(1 for p in preds if p.direction == ensemble_pred.consensus_direction)
-            direction_agreement = direction_votes / len(preds) if preds else 0
+            # Check direction agreement (only count non-neutral predictions)
+            non_neutral_preds = [p for p in preds if p.direction != 0]
+            if non_neutral_preds:
+                direction_votes = sum(1 for p in non_neutral_preds if p.direction == ensemble_pred.consensus_direction)
+                direction_agreement = direction_votes / len(non_neutral_preds)
+            else:
+                direction_agreement = 0
 
             if direction_agreement < self.config.min_direction_agreement:
                 print(f"DEBUG: {symbol} - filtered (direction_agreement {direction_agreement:.2f} < {self.config.min_direction_agreement})")
