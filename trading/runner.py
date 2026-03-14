@@ -617,7 +617,7 @@ class TradingRunner:
                         trades.append(trade)
 
             # Open new position if signal is strong
-            if signal.strength > 0.7 and signal.symbol not in self._positions:
+            if signal.strength > 0.5 and signal.symbol not in self._positions:
                 trade = await self._open_position(signal)
                 if trade:
                     trades.append(trade)

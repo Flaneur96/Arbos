@@ -235,12 +235,13 @@ class FoundationModelRegistry:
         self._llm_models: dict[str, any] = {}
 
     def register(self, model):
-        if hasattr(model, 'model_name'):
-            if isinstance(model, FoundationModelWrapper):
-                self._models[model.model_name] = model
-            else:
-                key = getattr(model, 'model', model.model_name)
-                self._llm_models[key] = model
+        # Check if it's a FoundationModelWrapper
+        if isinstance(model, FoundationModelWrapper):
+            self._models[model.model_name] = model
+        elif hasattr(model, 'model') or hasattr(model, 'model_name'):
+            # LLMForecaster or similar - use 'model' attribute as key
+            key = getattr(model, 'model', getattr(model, 'model_name', 'unknown'))
+            self._llm_models[key] = model
 
     async def get_model(self, name: str):
         if name in self._models:
