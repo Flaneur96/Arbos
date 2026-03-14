@@ -303,8 +303,10 @@ class TradingRunner:
             "pnl_history": list(self._pnl_history)[-1000:]  # Last 1000
         }
 
+        print(f"DEBUG: Saving state to {state_file}, positions: {len(self._positions)}")
         with open(state_file, "w") as f:
             json.dump(data, f, indent=2)
+        print(f"DEBUG: State saved successfully")
 
     # ==================== MAIN LOOP ====================
 
