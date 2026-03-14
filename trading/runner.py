@@ -644,7 +644,10 @@ class TradingRunner:
             mids = await self._hyperliquid.get_mids()
             price = mids.get(signal.symbol)
 
+            print(f"DEBUG: Opening position for {signal.symbol}, price={price}, mids={list(mids.keys()) if mids else 'None'}")
+
             if not price:
+                print(f"DEBUG: No price for {signal.symbol}, skipping position")
                 return None
 
             # Calculate position size (paper trading)
