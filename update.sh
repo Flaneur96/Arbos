@@ -1,18 +1,13 @@
 #!/bin/bash
 cd /Arbos
-
-# Auto-update from GitHub before each start
 git fetch origin main --quiet 2>/dev/null
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
 if [ "$LOCAL" != "$REMOTE" ]; then
-    echo "[auto-update] Pulling new changes..."
+    echo "$(date): Pulling updates..."
     git reset --hard origin/main
-    # Reinstall deps in case pyproject.toml changed
     /root/.local/bin/uv pip install -e . --quiet 2>/dev/null
-    # Reinstall claude-code in case it needs updating
     npm install -g @anthropic-ai/claude-code --quiet 2>/dev/null
+    pm2 restart arbos
+    echo "$(date): Restarted with $(git rev-parse --short HEAD)"
 fi
-
-source .venv/bin/activate
-exec python arbos.py
